@@ -8,21 +8,25 @@ usage() {
     cat <<EOF
     usage: $0 [ OPTION ]
     Options
-    -a         AWS Account ID (10 digit int)
+    -a         AWS Account CR Name on cluster
+    -i         AWS Account ID (10 digit int)
     -p         AWS Profile, leave blank for none
 EOF
 }
 
-if ( ! getopts ":a:p:h" opt); then
+if ( ! getopts ":a:i:p:h" opt); then
     echo ""
     echo "    $0 requries an argument!"
     usage
     exit 1 
 fi
 
-while getopts ":a:p:h" opt; do
+while getopts ":a:i:p:h" opt; do
     case $opt in
         a)
+            AWS_ACCOUNT_CR_NAME="$OPTARG" >&2
+            ;;
+        i)
             AWS_ACCOUNT_ID_ARG="$OPTARG" >&2
             ;;
         p)
@@ -46,8 +50,12 @@ while getopts ":a:p:h" opt; do
     esac
 done
 
+if [ -z "$AWS_ACCOUNT_CR_NAME" ]; then
+    echo "AWS Account CR Name required"
+fi
+
 if [ -z "$AWS_ACCOUNT_ID_ARG" ]; then
-    echo "Account ID required"
+    echo "AWS Account ID required"
 fi
 
 # Assume role
@@ -58,7 +66,6 @@ else
 fi
 
 AWS_STS_SESSION_NAME="SREResetFailedAccount"
-AWS_PROFILE="orgtest"
 
 SUPPORTED_REGIONS=(
   "us-east-1"
@@ -81,36 +88,36 @@ SUPPORTED_REGIONS=(
 # Get the account ID and check its part of the correct AWS payer account organization
 AWS_ACCOUNT_ID=$(aws organizations list-accounts | jq -r --arg AWS_ACCOUNT_ID_ARG $AWS_ACCOUNT_ID_ARG '.Accounts[] | select(.Id==$AWS_ACCOUNT_ID_ARG) | .Id')
 if [ -z "$AWS_ACCOUNT_ID" ]; then
-    echo "Account ID is not part of organization"
+    echo "AWS Account ID is not part of organization"
+    exit 1
 else
-    echo "Account ID $AWS_ACCOUNT_ID"
+    echo "AWS Account ID $AWS_ACCOUNT_ID"
 fi
 
-# Get organization ID here and echo it next
+# # Assume role
+# AWS_ASSUME_ROLE=$(aws sts assume-role --role-arn arn:aws:iam::"${AWS_ACCOUNT_ID}":role/OrganizationAccountAccessRole --role-session-name ${AWS_STS_SESSION_NAME})
+#
+# AWS_ACCESS_KEY_ID=$(echo "$AWS_ASSUME_ROLE" | jq -r '.Credentials.AccessKeyId')
+# AWS_SECRET_ACCESS_KEY=$(echo "$AWS_ASSUME_ROLE" | jq -r '.Credentials.SecretAccessKey')
+# AWS_SESSION_TOKEN=$(echo "$AWS_ASSUME_ROLE" | jq -r '.Credentials.SessionToken')
+#
+# export AWS_ACCESS_KEY_ID
+# export AWS_SECRET_ACCESS_KEY
+# export AWS_SESSION_TOKEN
+#
+# # Echo out the account we are using
+# aws sts get-caller-identity
 
-# Assume role
-AWS_ASSUME_ROLE=$(aws sts assume-role --role-arn arn:aws:iam::"${AWS_ACCOUNT_ID}":role/OrganizationAccountAccessRole --role-session-name ${AWS_STS_SESSION_NAME})
-
-AWS_ACCESS_KEY_ID=$(echo "$AWS_ASSUME_ROLE" | jq -r '.Credentials.AccessKeyId')
-AWS_SECRET_ACCESS_KEY=$(echo "$AWS_ASSUME_ROLE" | jq -r '.Credentials.SecretAccessKey')
-AWS_SESSION_TOKEN=$(echo "$AWS_ASSUME_ROLE" | jq -r '.Credentials.SessionToken')
-
-export AWS_ACCESS_KEY_ID
-export AWS_SECRET_ACCESS_KEY
-export AWS_SESSION_TOKEN
-
-# Echo out the account we are using
-aws sts get-caller-identity
-
-# Check account for any instances in all regions
-
+# Check AWS account for instances in all regions and terminate them
 for REGION in "${SUPPORTED_REGIONS[@]}"
 do
 
-  INSTANCE_LIST=( $(aws ec2 describe-instances --region="$REGION" | jq -r '.Reservations[].Instances[].InstanceId') )
+  # INSTANCE_LIST=( $(aws ec2 describe-instances --region="$REGION" | jq -r '.Reservations[].Instances[].InstanceId') )
+  # Get a list of instance IDs
+  INSTANCE_LIST=( $(cat < describe-instances.json | jq -r '.Reservations[].Instances[].InstanceId') )
 
-  # Terminate any instances we find
-  if [ "${#INSTANCE_LIST[@]}" > 0 ]; then
+  # Terminate any instances ids we find
+  if [ "${#INSTANCE_LIST[@]}" -gt 0 ]; then
       echo "Found ${#INSTANCE_LIST[@]} instance(s) in region $REGION"
       for id in $"${INSTANCE_LIST[@]}"
       do
@@ -120,29 +127,54 @@ do
   fi
 done
 
-# Check that there are no IAM users
+# Check that there are no IAM users, if there are remove their login profile
+# and then detach their policy ARNs (You can't delete the user without doing this first)
 
-for IAM_USER in $(aws iam list-users | jq -r '.Users[].UserName'); do
+# for IAM_USER in $(aws iam list-users | jq -r '.Users[].UserName'); do
+for IAM_USER in $(cat < iam-users.json | jq -r '.Users[].UserName'); do
     echo "Cleaning up IAM user: $IAM_USER"
     exit 0
-    aws iam delete-login-profile --user-name "$IAM_USER" 2> /dev/null
-    if [ $? -eq 0 ]; then
-        echo "Deleted login profile for user $IAM_USER"
+
+    # Check to see if a IAM login profile exists
+    LOGIN_PROFILE=$(aws iam get-login-profile --user-name "$IAM_USER" | jq -r '.LoginProfile.UserName')
+
+    # If the login profile exists delete it
+    if ! [ "$LOGIN_PROFILE" = "" ]; then
+      echo "Deleting login profile $LOGIN_PROFILE"
+      # if aws iam delete-login-profile --user-name "$IAM_USER" 2> /dev/null; then
+      #     echo "Deleted login profile for user $IAM_USER"
+      # fi
+    else
+        echo "No login profile for IAM user: $IAM_USER"
     fi
-    # Delete policy attached to IAM user
-    aws iam detach-user-policy --user-name "$IAM_USER" --policy-arn "arn:aws:iam::aws:policy/AdministratorAccess"
+
+    # Get attached policy ARNs to IAM user
+    ATTACHED_USER_POLICY_ARNS=( $(aws iam list-attached-user-policies --user-name "$IAM_USER" | jq -r '.AttachedPolicies[].PolicyArn') )
+    for POLICY_ARN in "${ATTACHED_USER_POLICY_ARNS[@]}"
+    do
+        # Detach those policy ARNs
+        #aws iam detach-user-policy --user-name "$IAM_USER" --policy-arn "arn:aws:iam::aws:policy/AdministratorAccess"
+        echo "aws iam detach-user-policy --user-name \"$IAM_USER\" --policy-arn \"$POLICY_ARN\""
+    done
     
     # List access keys created for user
-    ADMIN_ACCESS_KEY_IDS=$(aws iam list-access-keys --user-name "$IAM_USER" | jq -r '.AccessKeyMetadata[].AccessKeyId')
+    ADMIN_ACCESS_KEY_IDS=( $(aws iam list-access-keys --user-name "$IAM_USER" | jq -r '.AccessKeyMetadata[].AccessKeyId') )
     
     # Delete access keys created for user
-    for ID in ${ADMIN_ACCESS_KEY_IDS}; do
+    for ID in "${ADMIN_ACCESS_KEY_IDS[@]}"; do
       echo "Deleting ACCESS KEY $ID"
-      aws iam delete-access-key --user-name "$IAM_USER" --access-key-id "${ID}"
+      echo "aws iam delete-access-key --user-name \"$IAM_USER\" --access-key-id \"${ID}\""
     done
 
     # Delete IAM user
-    aws iam delete-user --user-name "$IAM_USER" 
+    echo "aws iam delete-user --user-name \"$IAM_USER\""
+done
+
+# Remove any secrets the belong to the Account CR
+
+for secret in $(oc get secrets -n aws-account-operator --no-headers | grep "${AWS_ACCOUNT_CR_NAME}" | awk '{print $1}'); do
+    echo "Deleting secret $secret"
+    echo "oc delete secret \"$secret\" -n aws-account-operator"
 done
 
 # # Reset status
@@ -157,8 +189,6 @@ done
 # AAO_SERVICE_ACCOUNT_NAME="aws-account-operator-token-s87z6"
 # 
 # TOKEN=$(oc get secret "${AAO_SERVICE_ACCOUNT_NAME}" -n aws-account-operator -o json | jq -r '.data.token' | base64 -d)
-# 
-# ACCOUNT_CR_NAME="osd-creds-mgmt-cfxdw2"
 #  
 # RETURN_CODE=$(curl -s -I -X GET $APISERVER/api --header "Authorization: Bearer $TOKEN" --insecure | grep -oE "HTTP\/2\ +[0-9]{3}")
 # 
@@ -168,12 +198,12 @@ done
 #     exit 1 
 # fi
 # 
-# PATCH_DATA='[{"op": "add", "path": "/status/rotateCredentials", "value": false}, {"op": "add", "path": "/status/claimed", "value": false}, {"op": "add", "path": "/status/state", "value": ""}]'
+# PATCH_DATA='[{"op": "add", "path": "/status/rotateCredentials", "value": false}, {"op": "add", "path": "/status/claimed", "value": false}, {"op": "add", "path": "/status/state", "value": ""}, {"op": "add", "path": "/status/conditions", "value": []}]'
 # 
 # curl --header "Content-Type: application/json-patch+json" \
 # --request PATCH \
 # --header "Authorization: Bearer $TOKEN" \
 # --insecure \
 # --data "${PATCH_DATA}" \
-# "${APISERVER}"/apis/aws.managed.openshift.io/v1alpha1/namespaces/aws-account-operator/accounts/"${ACCOUNT_CR_NAME}"/status
+# "${APISERVER}"/apis/aws.managed.openshift.io/v1alpha1/namespaces/aws-account-operator/accounts/"${AWS_ACCOUNT_CR_NAME}"/status
 
