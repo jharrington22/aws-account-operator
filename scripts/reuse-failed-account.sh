@@ -117,7 +117,7 @@ export AWS_SESSION_TOKEN
 # Echo out the account we are using
 STS_CALLER_IDENTITY="$(aws sts get-caller-identity | jq -r '.Account')"
 
-echo "AWS ACCOUNT ID: $AWS_ACCOUNT_ID STS CALLER IDENTITY: $STS_CALLER_IDENTITY"
+echo "!!!THESE SHOULD IDS MATCH!!! AWS ACCOUNT ID: $AWS_ACCOUNT_ID STS CALLER IDENTITY: $STS_CALLER_IDENTITY"
 # if [[ "${AWS_ACCOUNT_ID}" == ${STS_CALLER_IDENTITY} ]]; then
 #     echo "Error assuming role? Caller identity doesn't match the AWS Account ID passed in"
 #     exit 1
