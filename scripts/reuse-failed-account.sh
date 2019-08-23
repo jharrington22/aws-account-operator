@@ -2,37 +2,25 @@
 set -o nounset
 set -o pipefail
 
-# Set profile
-# AWS_PROFILE="us-east-1"
-# AWS_DEFAULT_REGION
-
 usage() {
     cat <<EOF
     usage: $0 [ OPTION ]
     Options
     -a         AWS Account CR Name on cluster
-    -i         AWS Account ID (10 digit int)
-    -p         AWS Profile, leave blank for none
 EOF
 }
 
-if ( ! getopts ":a:i:p:h" opt); then
+if ( ! getopts ":a:h" opt); then
     echo ""
     echo "    $0 requries an argument!"
     usage
     exit 1 
 fi
 
-while getopts ":a:i:p:h" opt; do
+while getopts ":a:h" opt; do
     case $opt in
         a)
             AWS_ACCOUNT_CR_NAME="$OPTARG" >&2
-            ;;
-        i)
-            AWS_ACCOUNT_ID_ARG="$OPTARG" >&2
-            ;;
-        p)
-            AWS_PROFILE="$OPTARG" >&2
             ;;
         h)
             echo "Invalid option: -$OPTARG" >&2
@@ -58,20 +46,15 @@ if [ -z "$AWS_ACCOUNT_CR_NAME" ]; then
     exit 1
 fi
 
-if [ -z "$AWS_ACCOUNT_ID_ARG" ]; then
-    echo "AWS Account ID required"
-    usage
-    exit 1
-fi
+# Get AWS account ID from CR
+AWS_ACCOUNT_ID_ARG=$(oc get account "$AWS_ACCOUNT_CR_NAME" -n aws-account-operator -o json | jq '.spec.awsAccountID')
 
-# Assume role
-if [ -z "$AWS_PROFILE" ]; then
-    echo "AWS Account Profile required"
-    usage
-    exit 1
-else
-    export AWS_PROFILE
-fi
+# Use AWS access keys from cluster
+AWS_ACCESS_KEY_ID=$(oc get secret aws-account-operator-credentials -n aws-account-operator -o json | jq -r '.data.aws_access_key_id' | base64 -d)
+AWS_SECRET_ACCESS_KEY=$(oc get secret aws-account-operator-credentials -n aws-account-operator -o json | jq -r '.data.aws_secret_access_key' | base64 -d)
+
+export AWS_ACCESS_KEY_ID
+export AWS_SECRET_ACCESS_KEY
 
 AWS_STS_SESSION_NAME="SREResetFailedAccount"
 
@@ -93,15 +76,22 @@ SUPPORTED_REGIONS=(
   "sa-east-1"
 )
 
+echo "Checking to see if account id $AWS_ACCOUNT_ID_ARG is in organziation"
+
 # Get the account ID and check its part of the correct AWS payer account organization
 AWS_ACCOUNT_ID="$(aws organizations list-accounts | jq -r --arg AWS_ACCOUNT_ID_ARG "$AWS_ACCOUNT_ID_ARG" '.Accounts[] | select(.Id==$AWS_ACCOUNT_ID_ARG) | .Id')"
+
+# You could output this once then read it from a file like so
 # AWS_ACCOUNT_ID="$(cat < list-accounts-orgtest.json | jq -r --arg AWS_ACCOUNT_ID_ARG "$AWS_ACCOUNT_ID_ARG" '.Accounts[] | select(.Id==$AWS_ACCOUNT_ID_ARG) | .Id')"
 if [ -z "$AWS_ACCOUNT_ID" ]; then
     echo "AWS Account ID is not part of organization"
     exit 1
 else
-    echo "AWS Account ID $AWS_ACCOUNT_ID"
+    echo "OK"
 fi
+
+unset AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY
 
 # Assume role
 AWS_ASSUME_ROLE=$(aws sts assume-role --role-arn arn:aws:iam::"${AWS_ACCOUNT_ID}":role/OrganizationAccountAccessRole --role-session-name ${AWS_STS_SESSION_NAME})
@@ -118,14 +108,15 @@ export AWS_SESSION_TOKEN
 STS_CALLER_IDENTITY="$(aws sts get-caller-identity | jq -r '.Account')"
 
 echo "!!!THESE SHOULD IDS MATCH!!! AWS ACCOUNT ID: $AWS_ACCOUNT_ID STS CALLER IDENTITY: $STS_CALLER_IDENTITY"
+sleep 5
+# I can't get this to work for some reason but this is a safety check that we should get to work
 # if [[ "${AWS_ACCOUNT_ID}" == ${STS_CALLER_IDENTITY} ]]; then
 #     echo "Error assuming role? Caller identity doesn't match the AWS Account ID passed in"
 #     exit 1
 # fi
 
 # Check AWS account for instances in all regions and terminate them
-for REGION in "${SUPPORTED_REGIONS[@]}"
-do
+for REGION in "${SUPPORTED_REGIONS[@]}"; do
 
   # Get a list of instance IDs
   INSTANCE_LIST=( $(aws ec2 describe-instances --region="$REGION" | jq -r '.Reservations[].Instances[].InstanceId') )
@@ -134,19 +125,18 @@ do
   # Terminate any instances ids we find
   if [ "${#INSTANCE_LIST[@]}" -gt 0 ]; then
       echo "Found ${#INSTANCE_LIST[@]} instance(s) in region $REGION"
-      for id in $"${INSTANCE_LIST[@]}"
-      do
+      for id in "${INSTANCE_LIST[@]}"; do
           echo "Terminating instance id $id"
           aws ec2 terminate-instances --region="$REGION" --instances-ids "$id"
       done
   fi
 done
 
-# Check that there are no IAM users, if there are remove their login profile
-# and then detach their policy ARNs (You can't delete the user without doing this first)
+# Check that there are no IAM users if there are remove their login profile
+# and then detach their policy ARNs you cant delete the user without doing this first
 
-for IAM_USER in $(aws iam list-users | jq -r '.Users[].UserName'); do
 # for IAM_USER in $(cat < iam-users.json | jq -r '.Users[].UserName'); do
+for IAM_USER in $(aws iam list-users | jq -r '.Users[].UserName'); do
     echo "Cleaning up IAM user: $IAM_USER"
 
     # Check to see if a IAM login profile exists
@@ -164,10 +154,9 @@ for IAM_USER in $(aws iam list-users | jq -r '.Users[].UserName'); do
 
     # Get attached policy ARNs to IAM user
     ATTACHED_USER_POLICY_ARNS=( $(aws iam list-attached-user-policies --user-name "$IAM_USER" | jq -r '.AttachedPolicies[].PolicyArn') )
-    for POLICY_ARN in "${ATTACHED_USER_POLICY_ARNS[@]}"
-    do
-        # Detach those policy ARNs
-        aws iam detach-user-policy --user-name "$IAM_USER" --policy-arn "$POLICY_ARN"
+    for POLICY_ARN in "${ATTACHED_USER_POLICY_ARNS[@]}"; do
+      # Detach those policy ARNs
+      aws iam detach-user-policy --user-name "$IAM_USER" --policy-arn "$POLICY_ARN"
     done
     
     # List access keys created for user
