@@ -262,6 +262,12 @@ func (r *ReconcileAccount) Reconcile(request reconcile.Request) (reconcile.Resul
 		return reconcile.Result{}, r.statusUpdate(reqLogger, currentAcctInstance)
 	}
 
+	// Update spec.legalEntity to blank if its empty
+	if currentAcctInstance.Spec.LegalEntity != (awsv1alpha1.LegalEntity{}) {
+		reqLogger.Info(fmt.Sprintf("Updating legalEntity on account %s", currentAcctInstance.Name))
+		return reconcile.Result{}, r.updateLegalEntityStruct(reqLogger, currentAcctInstance)
+	}
+
 	// We expect this secret to exist in the same namespace Account CR's are created
 	awsSetupClient, err := awsclient.GetAWSClient(r.Client, awsclient.NewAwsClientInput{
 		SecretName: controllerutils.AwsSecretName,
@@ -1033,6 +1039,18 @@ func createCase(reqLogger logr.Logger, accountID string, client awsclient.Client
 	reqLogger.Info("Support case created", "AccountID", accountID, "CaseID", caseResult.CaseId)
 
 	return *caseResult.CaseId, nil
+}
+
+func (r *ReconcileAccount) updateLegalEntityStruct(reqLogger logr.Logger, account *awsv1alpha1.Account) error {
+	account.Spec.LegalEntity = awsv1alpha1.LegalEntity{
+		Name: "",
+		ID:   "",
+	}
+	err := r.Client.Update(context.TODO(), account)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func checkCaseResolution(reqLogger logr.Logger, caseID string, client awsclient.Client) (bool, error) {

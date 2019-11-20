@@ -121,7 +121,7 @@ func main() {
 	// Configure metrics if it errors log the error but continue
 	if err := metrics.ConfigureMetrics(context.TODO(), *metricsServer); err != nil {
 		log.Error(err, "Failed to configure Metrics")
-		os.Exit(1)
+		// os.Exit(1)
 	}
 
 	// Define stopCh which we'll use to notify the secretWatcher (any any other routine)
